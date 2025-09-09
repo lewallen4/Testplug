@@ -1,0 +1,115 @@
+# org-asset-alignment.sentinel
+import "tfrun"
+import "tfplan/v2" as tfplan
+import "strings"
+import "types"
+
+# CONFIG: change based on your naming/tagging conventions
+# Example: workspace name "acme-prod-app" -> org = "acme"
+workspace_name = tfrun.workspace.name
+# How to parse org from workspace name: take first token before '-' (adjust if your convention differs)
+org_from_workspace = workspace_name.split("-")[0]
+
+# Tag keys to check (try these in order)
+tag_keys = ["organization", "Organization", "org", "Org", "owner", "Owner"]
+
+# helper: get provider (best-effort)
+get_provider = func(rc) {
+    # many tfplan resource_changes include a provider_name field; prefer that
+    if rc.provider_name is not null and rc.provider_name != "" {
+        return rc.provider_name
+    }
+
+    # fallback: use resource type prefix: aws_ azurerm google_
+    if rc.type is not null {
+        if rc.type.startsWith("aws_") { return "aws" }
+        if rc.type.startsWith("azurerm_") { return "azure" }
+        if rc.type.startsWith("google_") { return "gcp" }
+    }
+
+    return "unknown"
+}
+
+# helper: read tags/organization value from a resource change (best-effort for many resource shapes)
+get_org_from_resource = func(rc) {
+    after = rc.change.after
+
+    # If no after (resource is being destroyed) skip
+    if after is null {
+        return null
+    }
+
+    # many providers store tags in "tags" map
+    if types.type_of(after.tags) is "map" {
+        for tag_keys as _, tk {
+            if after.tags[tk] is not null and after.tags[tk] != "" {
+                return tostring(after.tags[tk])
+            }
+        }
+    }
+
+    # Azure: some resources may use 'tags' as well; try resource-specific fallbacks
+    # e.g. for azure resources some have 'resource_group_name' or 'name' or 'subscription_id'
+    # You might decide to map resource_group -> org via naming conventions
+    # Example fallback: for azure, check if resource_group_name includes org token
+    if get_provider(rc) is "azure" {
+        if after.resource_group_name is not null and types.type_of(after.resource_group_name) is "string" {
+            # parse resource group name for org token (customize as needed)
+            rg = after.resource_group_name
+            # simple heuristic: first token before '-'
+            return rg.split("-")[0]
+        }
+    }
+
+    # If tag not found, return null (caller will treat as violation or unknown)
+    return null
+}
+
+# Collect all changed/created managed resources to check
+relevant_resources = filter tfplan.resource_changes as address, rc {
+    rc.mode is "managed" and
+    # only consider creates/updates (skip destroy-only)
+    (rc.change.actions contains "create" or rc.change.actions contains "update")
+}
+
+violations = {}
+
+for relevant_resources as addr, rc {
+    provider = get_provider(rc)
+    resource_org = get_org_from_resource(rc)
+
+    if resource_org is null {
+        # treat missing org tag as violation; optionally you can allow unknowns for computed attrs
+        # If the attribute is computed-only and unknown at plan time, you can detect with change.after_unknown
+        if rc.change.after_unknown is not null and rc.change.after_unknown.tags is true {
+            # attribute is computed - treat as violation or special case (here we treat as violation)
+            violations[addr] = {
+                "reason": "org-tag-computed-or-missing",
+                "provider": provider,
+                "workspace_org": org_from_workspace
+            }
+        } else {
+            violations[addr] = {
+                "reason": "org-tag-missing",
+                "provider": provider,
+                "workspace_org": org_from_workspace
+            }
+        }
+        continue
+    }
+
+    # normalize compare case-insensitive
+    if strings.lower(resource_org) != strings.lower(org_from_workspace) {
+        violations[addr] = {
+            "reason": "org-mismatch",
+            "provider": provider,
+            "resource_org": resource_org,
+            "workspace_org": org_from_workspace
+        }
+    }
+}
+
+main = rule {
+    # policy passes only if there are no violations
+    length(violations) is 0
+}
